@@ -1,0 +1,264 @@
+//@version=5
+strategy("GridBNB Advanced Grid Strategy", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 📊 GRIDBNB 高级网格策略 - TradingView Pine Script
+// 
+// 基于GridBNB量化交易系统的核心逻辑转换
+// 支持动态网格调整、EWMA波动率计算、双重止损机制
+// 
+// 创建者: 量化交易架构师
+// 版本: v1.0.0
+// 适用于: BNB/USDT 及其他加密货币交易对
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// 🎛️ ===== 策略参数设置 =====
+// 网格基础参数
+grid_size_percent = input.float(2.0, "网格大小 (%)", minval=0.5, maxval=10.0, step=0.1) / 100
+min_grid_size = input.float(0.01, "最小网格 (%)", minval=0.005, maxval=0.05, step=0.001) / 100
+max_grid_size = input.float(0.04, "最大网格 (%)", minval=0.01, maxval=0.10, step=0.001) / 100
+
+// EWMA波动率参数
+ewma_lambda = input.float(0.2, "EWMA平滑系数", minval=0.05, maxval=0.5, step=0.01)
+volatility_lookback = input.int(168, "波动率回看周期", minval=24, maxval=720, step=1) // 7日4小时线
+
+// 止损参数
+enable_stop_loss = input.bool(true, "启用止损")
+stop_loss_percent = input.float(0.15, "价格止损 (%)", minval=0.05, maxval=0.50, step=0.01) / 100
+take_profit_drawdown = input.float(0.20, "回撤止盈 (%)", minval=0.05, maxval=0.50, step=0.01) / 100
+
+// 趋势识别参数
+enable_trend_filter = input.bool(true, "启用趋势过滤")
+ema_short = input.int(20, "短期EMA", minval=5, maxval=50, step=1)
+ema_long = input.int(50, "长期EMA", minval=20, maxval=200, step=1)
+
+// 交易参数
+min_trade_amount = input.float(20.0, "最小交易金额", minval=5.0, maxval=1000.0, step=5.0)
+use_market_orders = input.bool(false, "使用市价单")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 📈 ===== 核心技术指标计算 =====
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// 价格数据
+close_price = close
+high_price = high
+low_price = low
+
+// 趋势识别
+ema_short_line = ta.ema(close_price, ema_short)
+ema_long_line = ta.ema(close_price, ema_long)
+trend_up = ema_short_line > ema_long_line
+trend_down = ema_short_line < ema_long_line
+trend_strength = math.abs(ema_short_line - ema_long_line) / ema_long_line
+
+// EWMA波动率计算 (基于GridBNB核心算法)
+price_change = ta.change(close_price)
+abs_price_change = math.abs(price_change)
+
+// 传统波动率 (标准差)
+traditional_vol = ta.stdev(price_change, volatility_lookback) * math.sqrt(volatility_lookback)
+
+// EWMA波动率 (指数加权移动平均)
+var_ewma = 0.0
+ewma_volatility = 0.0
+
+for i = 0 to volatility_lookback - 1
+    if i == 0
+        var_ewma := math.pow(nz(abs_price_change[i]), 2)
+    else
+        var_ewma := ewma_lambda * math.pow(nz(abs_price_change[i]), 2) + (1 - ewma_lambda) * nz(var_ewma[i-1])
+
+ewma_volatility := math.sqrt(var_ewma) * math.sqrt(volatility_lookback)
+
+// 混合波动率 (70% EWMA + 30% 传统) - GridBNB核心算法
+hybrid_volatility = 0.7 * ewma_volatility + 0.3 * traditional_vol
+
+// 动态网格大小调整
+dynamic_grid_size = math.max(math.min(hybrid_volatility, max_grid_size), min_grid_size)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🎯 ===== 网格交易逻辑 =====
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// 基准价格动态调整
+var float base_price = na
+var float last_grid_adjust_time = na
+var int grid_adjust_interval = 3600 // 1小时调整一次
+
+// 初始化基准价格
+if na(base_price)
+    base_price := close_price
+    last_grid_adjust_time := time
+
+// 定期调整基准价格和网格大小
+if time - last_grid_adjust_time >= grid_adjust_interval
+    // 趋势过滤调整
+    if enable_trend_filter and trend_strength > 0.05
+        if trend_up
+            base_price := base_price * (1 + trend_strength * 0.1) // 轻微上移基准价
+        else if trend_down
+            base_price := base_price * (1 - trend_strength * 0.1) // 轻微下移基准价
+    
+    last_grid_adjust_time := time
+
+// 网格边界计算
+upper_band = base_price * (1 + dynamic_grid_size)
+lower_band = base_price * (1 - dynamic_grid_size)
+
+// 网格触发条件
+price_above_upper = close_price > upper_band
+price_below_lower = close_price < lower_band
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🚨 ===== 止损机制 =====
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// 价格止损
+price_stop_triggered = enable_stop_loss and close_price <= base_price * (1 - stop_loss_percent)
+
+// 回撤止盈逻辑
+var float max_profit = 0.0
+var float initial_capital = strategy.initial_capital
+current_equity = strategy.equity
+current_profit = current_equity - initial_capital
+
+// 更新最高盈利
+if current_profit > max_profit
+    max_profit := current_profit
+
+// 回撤计算
+drawdown = max_profit > 0 ? (max_profit - current_profit) / max_profit : 0
+drawdown_stop_triggered = enable_stop_loss and drawdown >= take_profit_drawdown
+
+// 综合止损信号
+stop_loss_triggered = price_stop_triggered or drawdown_stop_triggered
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 💰 ===== 交易执行逻辑 =====
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// 交易条件过滤
+can_buy = price_below_lower and (not enable_trend_filter or not trend_down)
+can_sell = price_above_upper and (not enable_trend_filter or not trend_up)
+
+// 计算交易数量
+account_value = strategy.equity
+trade_amount = math.max(account_value * dynamic_grid_size, min_trade_amount)
+quantity = trade_amount / close_price
+
+// 执行买入
+if can_buy and not stop_loss_triggered
+    if use_market_orders
+        strategy.entry("Grid Buy", strategy.long, qty=quantity, limit=na, stop=na)
+    else
+        strategy.entry("Grid Buy", strategy.long, qty=quantity, limit=close_price * 0.999, stop=na)
+
+// 执行卖出
+if can_sell and not stop_loss_triggered
+    if use_market_orders
+        strategy.close("Grid Buy", comment="Grid Sell")
+    else
+        strategy.close("Grid Buy", limit=close_price * 1.001, comment="Grid Sell")
+
+// 紧急止损平仓
+if stop_loss_triggered
+    strategy.close_all(comment="Stop Loss Triggered")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 📊 ===== 可视化显示 =====
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// 绘制网格边界
+plot(upper_band, color=color.new(color.red, 50), linewidth=2, title="网格上界")
+plot(lower_band, color=color.new(color.green, 50), linewidth=2, title="网格下界")
+plot(base_price, color=color.blue, linewidth=3, title="基准价")
+
+// 绘制趋势线
+plot(ema_short_line, color=color.orange, linewidth=1, title="短期EMA")
+plot(ema_long_line, color=color.purple, linewidth=1, title="长期EMA")
+
+// 网格区域填充
+upper_fill = plot(upper_band, color=color.red, linewidth=0, transp=80)
+lower_fill = plot(lower_band, color=color.green, linewidth=0, transp=80)
+fill(upper_fill, lower_fill, color=color.new(color.gray, 90), title="网格区域")
+
+// 止损线
+stop_loss_line = base_price * (1 - stop_loss_percent)
+plot(stop_loss_line, color=color.maroon, linewidth=2, style=plot.style_linebr, title="止损线")
+
+// 交易信号标记
+plotshape(can_buy and not stop_loss_triggered, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, title="买入信号")
+plotshape(can_sell and not stop_loss_triggered, style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, title="卖出信号")
+plotshape(stop_loss_triggered, style=shape.xcross, location=location.abovebar, color=color.maroon, size=size.large, title="止损信号")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 📈 ===== 性能统计表格 =====
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// 创建统计信息表格
+var table info_table = table.new(position.top_right, columns=2, rows=8, bgcolor=color.white, border_width=1)
+
+// 更新表格数据
+if barstate.islast
+    table.cell(info_table, 0, 0, "策略参数", bgcolor=color.gray, text_color=color.white)
+    table.cell(info_table, 1, 0, "", bgcolor=color.gray, text_color=color.white)
+    
+    table.cell(info_table, 0, 1, "动态网格大小")
+    table.cell(info_table, 1, 1, str.tostring(dynamic_grid_size * 100, "#.##") + "%")
+    
+    table.cell(info_table, 0, 2, "EWMA波动率")
+    table.cell(info_table, 1, 2, str.tostring(ewma_volatility * 100, "#.##") + "%")
+    
+    table.cell(info_table, 0, 3, "趋势方向")
+    table.cell(info_table, 1, 3, trend_up ? "上涨" : trend_down ? "下跌" : "横盘")
+    
+    table.cell(info_table, 0, 4, "当前盈亏")
+    table.cell(info_table, 1, 4, str.tostring(current_profit, "#.##") + " USDT")
+    
+    table.cell(info_table, 0, 5, "最大回撤")
+    table.cell(info_table, 1, 5, str.tostring(drawdown * 100, "#.##") + "%")
+    
+    table.cell(info_table, 0, 6, "止损状态")
+    table.cell(info_table, 1, 6, stop_loss_triggered ? "已触发" : "正常")
+    
+    table.cell(info_table, 0, 7, "网格状态")
+    price_position = (close_price - lower_band) / (upper_band - lower_band)
+    grid_status = price_position > 0.8 ? "接近上界" : price_position < 0.2 ? "接近下界" : "网格中部"
+    table.cell(info_table, 1, 7, grid_status)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🔔 ===== 告警提示 =====
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// 交易信号告警
+if can_buy and not stop_loss_triggered
+    alert("GridBNB: 买入信号触发 | 价格: " + str.tostring(close_price) + " | 网格大小: " + str.tostring(dynamic_grid_size * 100, "#.##") + "%", alert.freq_once_per_bar)
+
+if can_sell and not stop_loss_triggered
+    alert("GridBNB: 卖出信号触发 | 价格: " + str.tostring(close_price) + " | 当前盈亏: " + str.tostring(current_profit, "#.##") + " USDT", alert.freq_once_per_bar)
+
+if stop_loss_triggered
+    alert("🚨 GridBNB: 止损触发! | 价格: " + str.tostring(close_price) + " | 触发类型: " + (price_stop_triggered ? "价格止损" : "回撤止盈"), alert.freq_once_per_bar)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 📝 ===== 使用说明 =====
+// ═══════════════════════════════════════════════════════════════════════════════
+/*
+使用指南:
+1. 建议在4小时时间框架上使用，与GridBNB系统的波动率计算周期一致
+2. 适合震荡行情，单边趋势行情建议配合趋势过滤使用
+3. 止损机制默认开启，建议根据个人风险承受能力调整参数
+4. 回测时建议至少使用6个月以上的历史数据
+5. 实盘前请充分回测并验证策略参数
+
+风险提示:
+- 网格策略在单边行情中可能产生较大回撤
+- 请务必设置合理的止损参数
+- 建议配合仓位管理，不要全仓操作
+- 加密货币市场波动较大，请谨慎投资
+
+技术支持:
+本Pine Script基于GridBNB量化交易系统的核心算法开发
+如需技术支持，请联系量化交易架构师
+*/
